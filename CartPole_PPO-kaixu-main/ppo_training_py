@@ -1,0 +1,608 @@
+# Essential imports
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import os
+import random
+from copy import deepcopy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal
+
+from dm_control import suite
+
+import imageio
+
+# Random seed setting utility
+def set_global_seed(seed_value: int) -> None:
+    
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Actor(policy) netwotrk
+class PolicyNetwork(nn.Module):
+    """Gaussian policy with an MLP backbone."""
+
+    def __init__(self, obs_dim: int, act_dim: int) -> None:
+        super().__init__()
+        # Enlarged network: 128-128 value selection
+        self.backbone = nn.Sequential(
+            nn.Linear(obs_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+        )
+        self.mean_layer = nn.Linear(128, act_dim)
+        # Slightly negative initial log std (moderate exploration)
+        self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
+
+    def forward(self, obs):
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.tensor(obs, dtype=torch.float32)
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
+        features = self.backbone(obs)
+        mean = self.mean_layer(features)
+        std = torch.exp(self.log_std)
+        return mean, std
+
+# Critic (value) network
+class ValueNetwork(nn.Module):
+    """State value function approximator."""
+
+    def __init__(self, obs_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(obs_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, obs):
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.tensor(obs, dtype=torch.float32)
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
+        return self.mlp(obs)
+
+
+class PPOTrainer:
+    """PPO agent for dm_control cartpole balance."""
+
+    # cartpole-balance selected as default environment in str = 'cartpole', task = 'balance'
+    def __init__(self, domain_name: str = 'cartpole', task_name: str = 'balance') -> None:
+        self.env = suite.load(domain_name=domain_name, task_name=task_name)
+        self.domain_name = domain_name
+        self.task_name = task_name
+
+        obs_spec = self.env.observation_spec()
+        self.obs_dim = int(sum(np.prod(spec.shape) for spec in obs_spec.values()))
+
+        action_spec = self.env.action_spec()
+        self.act_low = action_spec.minimum
+        self.act_high = action_spec.maximum
+        self.act_dim = int(action_spec.shape[0])
+
+        self.policy = PolicyNetwork(self.obs_dim, self.act_dim)
+        self.value_function = ValueNetwork(self.obs_dim)
+
+        # Slightly adjusted learning rates
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=2.5e-4)
+        self.value_optimizer = optim.Adam(self.value_function.parameters(), lr=2.5e-4)
+
+        self.old_policy = None
+
+        # PPO / GAE hyper-parameters (with a lot of tryouts)
+        self.clip_epsilon = 0.2
+        self.discount_gamma = 0.99
+        self.gae_lambda = 0.95
+        self.minibatch_size = 96
+        self.num_update_epochs = 8
+        self.target_kl = 0.02
+        self.entropy_coef = 0.0005
+
+        # Logging containers
+        self.episode_returns = []
+        self.episode_kls = []
+        self.eval_points = []
+        self.eval_scores = []
+        self.total_env_steps = 0
+
+    # ======================
+    #  Helper functions like action selection, GAE, PPO update
+    # ======================
+
+    def _obs_to_vector(self, time_step):
+        """Flatten dm_control observation dict into a 1D numpy array."""
+        obs_dict = time_step.observation
+        pieces = []
+        for key in sorted(obs_dict.keys()):
+            val = obs_dict[key]
+            pieces.append(val.flatten())
+        return np.concatenate(pieces)
+
+    def select_action(self, obs_vec):
+        """Sample action from current policy (Gaussian)."""
+        mean, std = self.policy(obs_vec)
+        dist = Normal(mean, std)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+
+        # Convert to numpy and clip to env bounds
+        action_np = action.squeeze().detach().cpu().numpy()
+        action_np = np.clip(action_np, self.act_low, self.act_high).astype(np.float32)
+
+        return action_np, float(log_prob.item()), float(entropy.item())
+
+    # GAE computation for advantage estimation
+    def _compute_gae_targets(self, rewards, values, next_value, dones):
+        """Compute GAE advantages and returns."""
+        advantages = []
+        gae = 0.0
+
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_val = next_value
+            else:
+                next_val = values[t + 1]
+
+            delta = rewards[t] + self.discount_gamma * next_val * (1 - dones[t]) - values[t]
+            gae = delta + self.discount_gamma * self.gae_lambda * (1 - dones[t]) * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        returns = advantages + torch.tensor(values, dtype=torch.float32)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages, returns
+
+    # Update step for PPO
+    def _run_ppo_update(self, states, actions, old_log_probs, advantages, returns):
+        """Perform PPO updates with multiple epochs/minibatches."""
+        policy_losses = []
+        value_losses = []
+        kl_values = []
+        entropy_values = []
+
+        self.old_policy = deepcopy(self.policy)
+        early_stop = False
+
+        for _ in range(self.num_update_epochs):
+            if early_stop:
+                break
+
+            for start in range(0, len(states), self.minibatch_size):
+                end = start + self.minibatch_size
+                batch_states = states[start:end]
+                batch_actions = actions[start:end]
+                batch_old_log_probs = old_log_probs[start:end]
+                batch_advantages = advantages[start:end]
+                batch_returns = returns[start:end]
+
+                with torch.no_grad():
+                    old_mean, old_std = self.old_policy(batch_states)
+                new_mean, new_std = self.policy(batch_states)
+
+                old_dist = Normal(old_mean, old_std)
+                new_dist = Normal(new_mean, new_std)
+
+                new_log_probs = new_dist.log_prob(batch_actions).sum(dim=-1)
+                entropy = new_dist.entropy().sum(dim=-1).mean()
+
+                kl = torch.distributions.kl_divergence(
+                    old_dist, new_dist
+                ).sum(dim=-1).mean().item()
+
+                if kl > 1.5 * self.target_kl:
+                    early_stop = True
+                    break
+
+                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                surrogate1 = ratio * batch_advantages
+                surrogate2 = torch.clamp(
+                    ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon
+                ) * batch_advantages
+                policy_loss = -torch.min(surrogate1, surrogate2).mean() - self.entropy_coef * entropy
+
+                values_pred = self.value_function(batch_states).squeeze()
+                value_loss = ((values_pred - batch_returns) ** 2).mean()
+
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.policy_optimizer.step()
+
+                self.value_optimizer.zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value_function.parameters(), 0.5)
+                self.value_optimizer.step()
+
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+                kl_values.append(kl)
+                entropy_values.append(entropy.item())
+
+        return {
+            "policy_loss": float(np.mean(policy_losses) if policy_losses else 0.0),
+            "value_loss": float(np.mean(value_losses) if value_losses else 0.0),
+            "kl_div": float(np.mean(kl_values) if kl_values else 0.0),
+            "entropy": float(np.mean(entropy_values) if entropy_values else 0.0),
+        }
+
+    # ======================
+    #  Training loop with GAE, logging, evaluation
+    # ======================
+
+    def train(
+        self,
+        max_episodes: int = 200,
+        max_steps: int = 1000, # Set to 1000 for cartpole
+        seed: int = 45,
+        save_interval: int = 80,
+        eval_every: int = 10,
+        eval_episodes: int = 3,
+        eval_seed: int = 10,
+    ):
+        """Main training loop."""
+        set_global_seed(seed)
+        os.makedirs('checkpoints_custom', exist_ok=True)
+
+        for episode_idx in range(max_episodes):
+            time_step = self.env.reset()
+            obs_vec = self._obs_to_vector(time_step)
+
+            episode_return = 0.0
+            episode_entropies = []
+
+            states = []
+            actions = []
+            rewards = []
+            log_probs = []
+            values = []
+            dones = []
+
+            for _ in range(max_steps):
+                action, log_prob, entropy = self.select_action(obs_vec)
+                value_estimate = self.value_function(obs_vec).item()
+                episode_entropies.append(entropy)
+
+                time_step = self.env.step(action)
+                next_obs_vec = self._obs_to_vector(time_step)
+                reward = float(time_step.reward) if time_step.reward is not None else 0.0
+                done = bool(time_step.last())
+
+                states.append(obs_vec)
+                actions.append(action)
+                rewards.append(reward)
+                log_probs.append(log_prob)
+                values.append(value_estimate)
+                dones.append(done)
+
+                obs_vec = next_obs_vec
+                episode_return += reward
+                self.total_env_steps += 1
+
+                if done:
+                    break
+
+            # Compute GAE and returns
+            advantages, returns = self._compute_gae_targets(
+                rewards,
+                values,
+                self.value_function(obs_vec).item(),
+                dones,
+            )
+
+            states_tensor = torch.tensor(np.array(states), dtype=torch.float32)
+            actions_tensor = torch.tensor(np.array(actions), dtype=torch.float32)
+            old_log_probs_tensor = torch.tensor(log_probs, dtype=torch.float32)
+
+            update_stats = self._run_ppo_update(
+                states_tensor,
+                actions_tensor,
+                old_log_probs_tensor,
+                advantages,
+                returns,
+            )
+
+            # Logging
+            self.episode_returns.append(episode_return)
+            self.episode_kls.append(update_stats.get("kl_div", 0.0))
+
+            if (episode_idx + 1) % 10 == 0:
+                recent_mean = float(np.mean(self.episode_returns[-10:]))
+                print(
+                    f"[train] episode {episode_idx+1:4d} | "
+                    f"steps {self.total_env_steps:6d} | "
+                    f"mean return (last 10) {recent_mean:7.2f}"
+                )
+
+            # Save per-run plots periodically (reward + KL only)
+            if (episode_idx + 1) % 50 == 0 or episode_idx == max_episodes - 1:
+                self._dump_detailed_plots()
+
+            # Evaluation
+            if eval_every > 0 and (
+                (episode_idx + 1) % eval_every == 0 or episode_idx == max_episodes - 1
+            ):
+                avg_eval_return = self._run_evaluation_rollouts(
+                    eval_seed, eval_episodes
+                )
+                self.eval_points.append(episode_idx)
+                self.eval_scores.append(avg_eval_return)
+                print(
+                    f"[eval ] episode {episode_idx+1:4d} | "
+                    f"avg eval return over {eval_episodes} episodes: {avg_eval_return:7.2f}"
+                )
+                if avg_eval_return >= 900.0:
+                    print(
+                        "        >>> target performance 900+ reached "
+                        "(training will continue to accumulate statistics)."
+                    )
+
+            # Periodic checkpoints
+            if (episode_idx + 1) % save_interval == 0:
+                self.save_checkpoint(episode_idx + 1)
+
+        return {
+            "train_returns": self.episode_returns,
+            "train_kls": self.episode_kls,
+            "eval_points": self.eval_points,
+            "eval_scores": self.eval_scores,
+        }
+
+    # ======================
+    #  Evaluation & File saving
+    # ======================
+
+    def _run_evaluation_rollouts(self, eval_seed: int, eval_episodes: int = 3) -> float:
+        """Run evaluation episodes with current policy (no exploration noise)."""
+        set_global_seed(eval_seed)
+        eval_env = suite.load(domain_name=self.domain_name, task_name=self.task_name)
+        returns = []
+
+        for _ in range(eval_episodes):
+            time_step = eval_env.reset()
+            obs_vec = self._obs_to_vector(time_step)
+            episode_return = 0.0
+
+            while not time_step.last():
+                with torch.no_grad():
+                    mean, _ = self.policy(obs_vec)
+                    action = mean.squeeze().cpu().numpy()
+                time_step = eval_env.step(action)
+                obs_vec = self._obs_to_vector(time_step)
+                reward = float(time_step.reward) if time_step.reward is not None else 0.0
+                episode_return += reward
+
+            returns.append(episode_return)
+
+        return float(np.mean(returns))
+
+    def save_checkpoint(self, episode_idx: int) -> None:
+        """Save policy and value networks to disk."""
+        policy_path = f'checkpoints_custom/policy_ep{episode_idx}.pth'
+        value_path = f'checkpoints_custom/value_ep{episode_idx}.pth'
+
+        torch.save(
+            {
+                "model_state_dict": self.policy.state_dict(),
+                "optimizer_state_dict": self.policy_optimizer.state_dict(),
+            },
+            policy_path,
+        )
+        torch.save(
+            {
+                "model_state_dict": self.value_function.state_dict(),
+                "optimizer_state_dict": self.value_optimizer.state_dict(),
+            },
+            value_path,
+        )
+
+        print(f"[checkpoint] saved policy/value networks at episode {episode_idx}")
+
+    def _dump_detailed_plots(self, out_dir: str = ".") -> None:
+        """Save per-episode reward and KL curves for this single run."""
+        if not self.episode_returns:
+            return
+
+        episodes_axis = np.arange(1, len(self.episode_returns) + 1)
+
+        # Reward trace
+        fig_r, ax_r = plt.subplots(figsize=(8, 3))
+        ax_r.plot(episodes_axis, self.episode_returns, label='episode return')
+        ax_r.set_ylabel('return')
+        ax_r.set_xlabel('episode')
+        ax_r.legend()
+        fig_r.tight_layout()
+        fig_r.savefig(os.path.join(out_dir, 'run_return_track.png'))
+        plt.close(fig_r)
+
+        # KL trace
+        if self.episode_kls:
+            fig_k, ax_k = plt.subplots(figsize=(8, 3))
+            ax_k.plot(episodes_axis, self.episode_kls, label='approx KL')
+            ax_k.set_ylabel('KL')
+            ax_k.set_xlabel('episode')
+            ax_k.legend()
+            fig_k.tight_layout()
+            fig_k.savefig(os.path.join(out_dir, 'run_kl_track.png'))
+            plt.close(fig_k)
+
+    # Video Generation (optional, not used in multi-seed experiments, but helpful for model performance visualization)
+    def record_policy_video(
+        self,
+        checkpoint_path: str,
+        video_path: str = "cartpole_control.mp4",
+        episode_seed: int = 10,
+        fps: int = 30,
+        max_frames: int = 1000,
+    ) -> None:
+    
+        # Load saved policy weights
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        self.policy.load_state_dict(checkpoint["model_state_dict"])
+        self.policy.eval()
+
+        # Fix randomness for the evaluation roll-out
+        set_global_seed(episode_seed)
+
+        # Create a fresh environment for recording (seeded)
+        video_env = suite.load(
+            domain_name=self.domain_name,
+            task_name=self.task_name,
+            task_kwargs={"random": episode_seed},
+        )
+
+        time_step = video_env.reset()
+        obs_vec = self._obs_to_vector(time_step)
+        frames = []
+
+        for _ in range(max_frames):
+            # Render current frame (RGB array)
+            frame = video_env.physics.render(height=480, width=640, camera_id=0)
+            frames.append(frame)
+
+            if time_step.last():
+                break
+
+            # Greedy (deterministic) action from the current policy
+            with torch.no_grad():
+                mean, _ = self.policy(obs_vec)
+                action = mean.squeeze().cpu().numpy()
+
+            time_step = video_env.step(action)
+            obs_vec = self._obs_to_vector(time_step)
+
+        # Save the recorded frames as a video file
+        imageio.mimsave(video_path, frames, fps=fps)
+        print(f"[video] saved evaluation rollout to {video_path}")
+        
+        # (Optional) switch back to training mode if you plan to keep training
+        self.policy.train()
+
+
+
+# ==========================
+#  Multi-seed experiment (3 seeds [0,1,2]) on cartpole-balance) as required by assignment description
+# ==========================
+
+def run_cartpole_experiments():
+    """Run PPO on cartpole-balance with multiple random seeds."""
+    # 3 seeds, 410 episodes (310 + 100)
+    experiment_seeds = [0, 1, 2]
+    max_episodes = 410
+    max_steps = 1024
+    eval_every = 10
+    eval_episodes = 3
+    eval_seed = 10
+
+    all_return_traces = []
+    all_kl_traces = []
+    all_eval_scores = []
+    eval_x = None
+
+    for s in experiment_seeds:
+        set_global_seed(s)
+        agent = PPOTrainer(domain_name='cartpole', task_name='balance')
+        history = agent.train(
+            seed=s,
+            max_episodes=max_episodes,
+            max_steps=max_steps,
+            save_interval=80,
+            eval_every=eval_every,
+            eval_episodes=eval_episodes,
+            eval_seed=eval_seed,
+        )
+
+        all_return_traces.append(history["train_returns"])
+        all_kl_traces.append(history["train_kls"])
+        all_eval_scores.append(history["eval_scores"])
+
+        if eval_x is None:
+            eval_x = history["eval_points"]
+
+    return_array = np.array(all_return_traces, dtype=np.float32)
+    kl_array = np.array(all_kl_traces, dtype=np.float32)
+
+    mean_return = return_array.mean(axis=0)
+    std_return = return_array.std(axis=0)
+    mean_kl = kl_array.mean(axis=0)
+    std_kl = kl_array.std(axis=0)
+
+    eval_array = np.array(all_eval_scores, dtype=np.float32)
+    eval_mean = eval_array.mean(axis=0)
+    eval_std = eval_array.std(axis=0)
+
+    episodes_axis = np.arange(1, max_episodes + 1, dtype=np.int32)
+
+    # Summary reward curve
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(episodes_axis, mean_return, label='mean episode return')
+    ax.fill_between(
+        episodes_axis,
+        mean_return - std_return,
+        mean_return + std_return,
+        alpha=0.3,
+    )
+
+    if eval_x is not None and len(eval_x) > 0:
+        eval_x_arr = np.array(eval_x, dtype=np.int32) + 1
+        ax.plot(eval_x_arr, eval_mean, marker='o', linestyle='-', label='eval mean')
+        ax.fill_between(
+            eval_x_arr,
+            eval_mean - eval_std,
+            eval_mean + eval_std,
+            alpha=0.25,
+        )
+
+    ax.set_xlabel('episode')
+    ax.set_ylabel('return')
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig('summary_return_profile.png')
+    plt.close(fig)
+
+    # Summary KL curve
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(episodes_axis, mean_kl, label='mean approx KL')
+    ax.fill_between(
+        episodes_axis,
+        mean_kl - std_kl,
+        mean_kl + std_kl,
+        alpha=0.3,
+    )
+    ax.set_xlabel('episode')
+    ax.set_ylabel('KL divergence')
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig('summary_kl_profile.png')
+    plt.close(fig)
+
+    print('Saved summary figures: summary_return_profile.png, summary_kl_profile.png')
+
+
+if __name__ == "__main__":
+    run_cartpole_experiments()
+
+    # Record a demo video with a the last checkpoint
+    agent = PPOTrainer(domain_name="cartpole", task_name="balance")
+    agent.record_policy_video(
+        checkpoint_path="checkpoints_custom/policy_ep400.pth",
+        video_path="cartpole_control_demo.mp4",
+        episode_seed=10,
+        fps=30,
+        max_frames=1000,
+    )
+
+
